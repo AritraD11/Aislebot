@@ -1,0 +1,17 @@
+[Unit]
+Description=AisleBot ROS2 Full Stack
+After=network.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=aritra
+WorkingDirectory=/home/aritra
+ExecStart=/bin/bash /home/aritra/start_aislebot.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

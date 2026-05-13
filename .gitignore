@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.ros/
+*.log
+build/
+install/
+log/

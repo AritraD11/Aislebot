@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<title>AisleBot Control</title>
+<style>
+  :root {
+    --bg:        #0b0d10;
+    --panel:     #16191e;
+    --panel-2:   #1d2128;
+    --line:      #2a2f38;
+    --text:      #e6e8ea;
+    --muted:     #8a8f97;
+    --accent:    #4cc9f0;
+    --warn:      #f4a261;
+    --danger:    #ef476f;
+    --ok:        #06d6a0;
+    --joy-bg:    #232830;
+    --joy-stick: #4cc9f0;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    height: 100%; width: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                 "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  .app {
+    display: flex; flex-direction: column;
+    height: 100dvh; width: 100vw;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  /* ── Header strip ──────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header .title { font-size: 14px; font-weight: 600; letter-spacing: 0.3px; }
+  header .title .sub { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .conn {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--danger); }
+
+  /* ── Main grid: drive on top, arm on bottom ──── */
+  main {
+    flex: 1 1 auto; display: grid;
+    grid-template-rows: 1fr auto;
+    gap: 10px; padding: 10px;
+    min-height: 0;
+  }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 12px;
+    display: flex; flex-direction: column;
+  }
+  .card h2 {
+    margin: 0 0 8px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted); font-weight: 600;
+  }
+
+  /* ── Drive joystick area ─────────────────────── */
+  .drive-card { min-height: 0; }
+  .drive-stage {
+    flex: 1 1 auto; min-height: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    align-items: stretch;
+  }
+  .joy-wrap {
+    background: var(--panel-2); border-radius: 14px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 8px;
+    min-height: 0;
+  }
+  .joy-wrap .label {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .joy {
+    position: relative;
+    width: 100%; aspect-ratio: 1;
+    max-width: 220px;
+    background: var(--joy-bg);
+    border: 1px solid var(--line);
+    border-radius: 50%;
+    touch-action: none;
+  }
+  .joy .stick {
+    position: absolute; left: 50%; top: 50%;
+    width: 36%; height: 36%;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: var(--joy-stick);
+    box-shadow: 0 4px 16px rgba(76, 201, 240, 0.3);
+    transition: transform 0.05s linear;
+  }
+  .joy .crosshair {
+    position: absolute; inset: 0;
+    pointer-events: none;
+  }
+  .joy .crosshair::before,
+  .joy .crosshair::after {
+    content: ''; position: absolute;
+    background: rgba(255,255,255,0.06);
+  }
+  .joy .crosshair::before {
+    left: 50%; top: 8%; bottom: 8%; width: 1px; transform: translateX(-50%);
+  }
+  .joy .crosshair::after {
+    top: 50%; left: 8%; right: 8%; height: 1px; transform: translateY(-50%);
+  }
+
+  /* ── Arm controls ─────────────────────────────── */
+  .arm-card { padding-bottom: 14px; }
+  .arm-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  }
+  .arm-section {
+    background: var(--panel-2); border-radius: 12px; padding: 10px;
+  }
+  .arm-section .label {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 8px;
+  }
+  .pair {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .hold-btn {
+    appearance: none; -webkit-appearance: none;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--text);
+    padding: 16px 8px;
+    border-radius: 10px;
+    font-size: 14px; font-weight: 600;
+    text-align: center;
+    transition: background 0.08s, border-color 0.08s, transform 0.06s;
+    touch-action: none;
+  }
+  .hold-btn .glyph { display: block; font-size: 22px; margin-bottom: 2px; }
+  .hold-btn.active {
+    background: var(--accent); color: #0b0d10;
+    border-color: var(--accent);
+    transform: scale(0.97);
+  }
+  .hold-btn.danger.active { background: var(--danger); border-color: var(--danger); }
+
+  /* ── Footer (HOME / ESTOP / CLEAR) ─────────────── */
+  footer {
+    padding: 10px;
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .fbtn {
+    appearance: none; -webkit-appearance: none;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    padding: 14px 8px;
+    border-radius: 12px;
+    font-size: 13px; font-weight: 700;
+    letter-spacing: 0.6px;
+  }
+  .fbtn.warn   { border-color: var(--warn);   color: var(--warn); }
+  .fbtn.danger { border-color: var(--danger); color: var(--danger); }
+  .fbtn.ok     { border-color: var(--ok);     color: var(--ok); }
+  .fbtn:active { transform: scale(0.97); }
+
+  /* ── Toast / status pill ───────────────────────── */
+  .toast {
+    position: fixed; left: 50%; top: 50px; transform: translateX(-50%);
+    background: rgba(0,0,0,0.8); color: var(--text);
+    padding: 8px 14px; border-radius: 999px;
+    font-size: 12px; opacity: 0; pointer-events: none;
+    transition: opacity 0.2s;
+    border: 1px solid var(--line);
+  }
+  .toast.show { opacity: 1; }
+
+  @media (orientation: landscape) and (max-height: 500px) {
+    .joy { max-width: 160px; }
+    .hold-btn { padding: 12px 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="title">AisleBot <span class="sub">unified control</span></div>
+    <div class="conn"><span id="dot" class="dot"></span><span id="connText">connecting…</span></div>
+  </header>
+
+  <main>
+    <!-- ─── DRIVE ─── -->
+    <section class="card drive-card">
+      <h2>Drive</h2>
+      <div class="drive-stage">
+        <div class="joy-wrap">
+          <div class="label">Translate</div>
+          <div class="joy" id="joyDrive">
+            <div class="crosshair"></div>
+            <div class="stick" id="stickDrive"></div>
+          </div>
+        </div>
+        <div class="joy-wrap">
+          <div class="label">Rotate / lift</div>
+          <div class="joy" id="joyRot">
+            <div class="crosshair"></div>
+            <div class="stick" id="stickRot"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── ARM ─── -->
+    <section class="card arm-card">
+      <h2>UV Arm</h2>
+      <div class="arm-grid">
+        <div class="arm-section">
+          <div class="label">Arms</div>
+          <div class="pair">
+            <button class="hold-btn" id="armOpen"><span class="glyph">↤ ↦</span>OPEN</button>
+            <button class="hold-btn" id="armClose"><span class="glyph">↦ ↤</span>CLOSE</button>
+          </div>
+        </div>
+        <div class="arm-section">
+          <div class="label">Lift</div>
+          <div class="pair">
+            <button class="hold-btn" id="liftUp"><span class="glyph">↑</span>UP</button>
+            <button class="hold-btn" id="liftDown"><span class="glyph">↓</span>DOWN</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <button class="fbtn warn"   id="btnHome">HOME</button>
+    <button class="fbtn danger" id="btnEstop">ESTOP</button>
+    <button class="fbtn ok"     id="btnClear">CLEAR</button>
+  </footer>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+(() => {
+  // ────────────── Element handles ──────────────
+  const dot      = document.getElementById('dot');
+  const connTxt  = document.getElementById('connText');
+  const joyDrive = document.getElementById('joyDrive');
+  const stickD   = document.getElementById('stickDrive');
+  const joyRot   = document.getElementById('joyRot');
+  const stickR   = document.getElementById('stickRot');
+
+  const btnArmOpen  = document.getElementById('armOpen');
+  const btnArmClose = document.getElementById('armClose');
+  const btnLiftUp   = document.getElementById('liftUp');
+  const btnLiftDown = document.getElementById('liftDown');
+
+  const btnHome  = document.getElementById('btnHome');
+  const btnEstop = document.getElementById('btnEstop');
+  const btnClear = document.getElementById('btnClear');
+
+  const toast = document.getElementById('toast');
+
+  // ────────────── WebSocket plumbing ──────────────
+  let ws = null;
+  let wsOpen = false;
+  let reconnectDelay = 500;
+  const TX_HZ = 25;       // send rate while driving
+  const HEARTBEAT_MS = 1000;
+
+  function setConn(state) {
+    dot.classList.remove('ok', 'bad');
+    if (state === 'ok')  { dot.classList.add('ok');  connTxt.textContent = 'connected'; }
+    if (state === 'bad') { dot.classList.add('bad'); connTxt.textContent = 'disconnected'; }
+    if (state === 'pending') { connTxt.textContent = 'connecting…'; }
+  }
+
+  function flash(msg) {
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => toast.classList.remove('show'), 1400);
+  }
+
+  function send(obj) {
+    if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  function connect() {
+    setConn('pending');
+    const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => {
+      wsOpen = true; reconnectDelay = 500;
+      setConn('ok');
+    };
+    ws.onclose = () => {
+      wsOpen = false; setConn('bad');
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch(_){} };
+  }
+  connect();
+
+  // Heartbeat keeps server's watchdog patient.
+  setInterval(() => send({ type: 'ping' }), HEARTBEAT_MS);
+
+  // ────────────── Joystick widget ──────────────
+  function makeJoystick(pad, stick, onChange, opts={}) {
+    const radius = () => pad.getBoundingClientRect().width / 2;
+    const maxOffset = () => radius() * 0.62;        // visual travel
+    let active = false, pid = null;
+    let nx = 0, ny = 0;
+
+    function setStick(x, y) {
+      const r = maxOffset();
+      const m = Math.hypot(x, y);
+      if (m > r) { x *= r / m; y *= r / m; }
+      stick.style.transform = `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
+    }
+
+    function start(e) {
+      e.preventDefault();
+      active = true;
+      const t = e.touches ? e.touches[0] : e;
+      pid = e.touches ? t.identifier : 'mouse';
+      move(e);
+    }
+    function move(e) {
+      if (!active) return;
+      e.preventDefault();
+      const rect = pad.getBoundingClientRect();
+      const t = e.touches ? Array.from(e.touches).find(t => t.identifier === pid) || e.touches[0] : e;
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top  + rect.height / 2;
+      let dx = t.clientX - cx;
+      let dy = t.clientY - cy;
+      const r = radius();
+      nx = Math.max(-1, Math.min(1, dx / r));
+      ny = Math.max(-1, Math.min(1, dy / r));
+      setStick(dx, dy);
+      onChange(nx, ny, true);
+    }
+    function end(e) {
+      if (!active) return;
+      e.preventDefault();
+      active = false; pid = null;
+      nx = 0; ny = 0;
+      setStick(0, 0);
+      onChange(0, 0, false);
+    }
+
+    pad.addEventListener('touchstart', start, { passive: false });
+    pad.addEventListener('touchmove',  move,  { passive: false });
+    pad.addEventListener('touchend',   end,   { passive: false });
+    pad.addEventListener('touchcancel',end,   { passive: false });
+    pad.addEventListener('mousedown',  start);
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup',   end);
+
+    return {
+      get value() { return [nx, ny]; },
+      get active() { return active; },
+    };
+  }
+
+  // Drive joystick: vy = X (strafe), vx = -Y (forward when stick up)
+  let drive = { vx: 0, vy: 0, wz: 0, lift: 0 };
+  let armCmd = { arm: 0, lift: 0 };
+
+  const joyD = makeJoystick(joyDrive, stickD, (x, y) => {
+    // ROS convention: +vx forward, +vy left.
+    // Screen coords: stick UP gives y<0, stick LEFT gives x<0 → flip both.
+    drive.vy = -x;
+    drive.vx = -y;
+  });
+  const joyR = makeJoystick(joyRot, stickR, (x, y) => {
+    drive.wz   = -x;       // stick LEFT = +wz (CCW)
+    drive.lift = -y;       // stick UP = +lift (up)
+  });
+
+  // ────────────── Hold-to-move buttons ──────────────
+  function holdButton(btn, downCb, upCb) {
+    let down = false;
+    function press(e) {
+      e.preventDefault();
+      if (down) return;
+      down = true; btn.classList.add('active'); downCb();
+    }
+    function release(e) {
+      if (!down) return;
+      e && e.preventDefault();
+      down = false; btn.classList.remove('active'); upCb();
+    }
+    btn.addEventListener('touchstart', press,    { passive: false });
+    btn.addEventListener('touchend',   release,  { passive: false });
+    btn.addEventListener('touchcancel',release,  { passive: false });
+    btn.addEventListener('mousedown',  press);
+    window.addEventListener('mouseup', release);
+    window.addEventListener('blur',    () => release());
+  }
+
+  let armBtn = 0, liftBtn = 0;
+  holdButton(btnArmOpen,  () => armBtn = +1, () => armBtn = 0);
+  holdButton(btnArmClose, () => armBtn = -1, () => armBtn = 0);
+  holdButton(btnLiftUp,   () => liftBtn = +1, () => liftBtn = 0);
+  holdButton(btnLiftDown, () => liftBtn = -1, () => liftBtn = 0);
+
+  // ────────────── Footer events ──────────────
+  btnHome.addEventListener('click', () => { send({type:'cmd', name:'HOME'});  flash('HOME'); });
+  btnEstop.addEventListener('click',() => { send({type:'cmd', name:'ESTOP'}); flash('ESTOP'); });
+  btnClear.addEventListener('click',() => { send({type:'cmd', name:'CLEAR'}); flash('cleared'); });
+
+  // ────────────── Transmission loop ──────────────
+  setInterval(() => {
+    if (!wsOpen) return;
+
+    // Drive: only publish when active OR when we just released
+    // (the on-release zero is what tells the bridge to brake)
+    const driveActive = joyD.active || joyR.active ||
+                        Math.abs(drive.vx) + Math.abs(drive.vy) +
+                        Math.abs(drive.wz) > 0;
+    if (driveActive) {
+      send({ type: 'drive', vx: drive.vx, vy: drive.vy, wz: drive.wz });
+    }
+
+    // Arm velocity: combine joystick lift with hold-buttons.
+    // Buttons override joystick when pressed.
+    const arm  = armBtn !== 0 ? armBtn : 0;
+    const lift = liftBtn !== 0 ? liftBtn : drive.lift;
+    armCmd.arm = arm; armCmd.lift = lift;
+
+    const armActive = joyR.active || armBtn !== 0 || liftBtn !== 0;
+    if (armActive || (Math.abs(arm) + Math.abs(lift) > 0)) {
+      send({ type: 'arm', arm, lift });
+    }
+  }, 1000 / TX_HZ);
+})();
+</script>
+</body>
+</html>

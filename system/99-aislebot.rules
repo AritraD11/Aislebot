@@ -1,0 +1,5 @@
+# ESP32 (CP2102) → /dev/esp32
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="esp32", MODE="0666"
+
+# Arduino Mega (CH340) → /dev/mega
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="mega", MODE="0666"
