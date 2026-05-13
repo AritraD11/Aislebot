@@ -8,7 +8,7 @@ Asymmetric Mecanum Omnidirectional Robot for Narrow-Aisle Warehouse Navigation
 ## Fresh Pi — one command
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/AritraD11/aislebot/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/AritraD11/Aislebot/main/install.sh)
 ```
 
 Installs everything: ROS2 Jazzy, Nav2, SLAM, all Python packages, builds the workspace, configures udev, systemd, and .bashrc. Takes ~25 minutes on a fresh Pi 5.
