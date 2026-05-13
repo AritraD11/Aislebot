@@ -21,7 +21,7 @@ set -e
 #  !! EDIT THIS BEFORE PUSHING TO GITHUB !!
 # ════════════════════════════════════════════════════════════════════════
 GITHUB_USER="AritrD11"
-GITHUB_REPO="aislebot"
+GITHUB_REPO="Aislebot"
 GITHUB_BRANCH="main"
 
 # ════════════════════════════════════════════════════════════════════════
