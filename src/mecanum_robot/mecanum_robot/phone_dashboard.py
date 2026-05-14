@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  AisleBot Phone Dashboard v2.0                                   ║
+║  AisleBot Phone Dashboard v2.1                                   ║
 ║  ROS2 Node + FastAPI WebSocket on port 8080                      ║
 ║                                                                  ║
 ║  Controls:                                                       ║
 ║    • Drive joystick (vx / vy) + separate yaw slider             ║
-║    • Speed: SLOW (25%) / NORMAL (60%) / FAST (100%)             ║
-║    • Arm: LIFT / LOWER / OPEN / CLOSE                           ║
+║    • Speed: SLOW (33%) / NORMAL (67%) / FAST (100%)             ║
+║    • Arm: LIFT / LOWER / OPEN / CLOSE (hold to move)           ║
 ║    • Record Run → ~/aislebot_logs/run_YYYYMMDD_HHMMSS.csv       ║
 ║    • E-STOP (latches) / CLEAR                                   ║
+║                                                                  ║
+║  FIXES in v2.1:                                                  ║
+║    • Speed buttons: touchstart replaces onclick (mobile fix)    ║
+║    • MAX_LINEAR lowered to 0.15 m/s (prevents motor saturation) ║
+║    • Auto-ENABLE arm on WebSocket connect                        ║
+║    • ESTOP CLEAR also re-enables arm                            ║
 ║                                                                  ║
 ║  ROS2 Topics:                                                    ║
 ║    Publishes  /cmd_vel          geometry_msgs/Twist  (drive)    ║
 ║    Publishes  /arm/command      std_msgs/String       (arm)     ║
 ║    Publishes  /esp32/command    std_msgs/String  (<L1>/<L0>/…)  ║
 ║    Subscribes /motor_telemetry  std_msgs/Float64MultiArray      ║
-║                                                                  ║
-║  ⚠  esp32_bridge.py must:                                       ║
-║      • Subscribe to /esp32/command → forward raw string serial  ║
-║      • Parse incoming telemetry CSV → publish /motor_telemetry  ║
-║      Float64MultiArray format (12 values):                      ║
-║      [FR_t, FR_a, FR_p, FL_t, FL_a, FL_p,                      ║
-║       RR_t, RR_a, RR_p, RL_t, RL_a, RL_p]                      ║
 ║                                                                  ║
 ║  Aritra Das (25D0074) — IIT Bombay — Prof. Ambarish Kunwar      ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -46,19 +45,23 @@ from datetime import datetime
 from typing import Optional, Set
 
 # ═══════════════════════════════════════════════════════════════════
-#  ROBOT CONSTANTS  (keep in sync with ESP32 firmware)
+#  ROBOT CONSTANTS
+#  FIX: MAX_LINEAR lowered from 0.48 → 0.15 m/s
+#       At 0.48, forward drive needed 6.3 rad/s — 2x the motor cap.
+#       0.15 m/s gives max wheel speed ~1.97 rad/s — safe headroom.
+#       SLOW/MED/FAST are now clearly different and always within limits.
 # ═══════════════════════════════════════════════════════════════════
-MAX_LINEAR_SPEED  = 0.48   # m/s   (MAX_WHEEL_SPEED × WHEEL_RADIUS)
-MAX_ANGULAR_SPEED = 1.0    # rad/s
+MAX_LINEAR_SPEED  = 0.15   # m/s   — matches established working value
+MAX_ANGULAR_SPEED = 0.30   # rad/s — matches joy_to_aislebot parameter
 
 SPEED_MODES = [
-    {"name": "SLOW",   "mult": 0.25, "label": "0.12 m/s"},
-    {"name": "NORMAL", "mult": 0.60, "label": "0.29 m/s"},
-    {"name": "FAST",   "mult": 1.00, "label": "0.48 m/s"},
+    {"name": "SLOW",   "mult": 0.33, "label": "0.05 m/s"},
+    {"name": "NORMAL", "mult": 0.67, "label": "0.10 m/s"},
+    {"name": "FAST",   "mult": 1.00, "label": "0.15 m/s"},
 ]
 
 # ═══════════════════════════════════════════════════════════════════
-#  HTML DASHBOARD  (served to the phone browser)
+#  HTML DASHBOARD
 # ═══════════════════════════════════════════════════════════════════
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -78,7 +81,8 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 .spd-group{display:flex;gap:4px;flex-shrink:0}
 .spd-btn{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;
          border:1.5px solid #1e3a5f;background:transparent;color:#4b5563;
-         cursor:pointer;letter-spacing:.5px;transition:all .15s;font-family:inherit}
+         cursor:pointer;letter-spacing:.5px;transition:all .15s;font-family:inherit;
+         touch-action:manipulation}
 .spd-btn.active-slow  {background:#052e16;color:#22c55e;border-color:#22c55e}
 .spd-btn.active-normal{background:#431407;color:#f59e0b;border-color:#f59e0b}
 .spd-btn.active-fast  {background:#450a0a;color:#ef4444;border-color:#ef4444}
@@ -91,8 +95,14 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 .rec-badge.show{display:inline-block;animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 
+/* ── SPEED INDICATOR ── */
+.spd-indicator{font-size:8px;color:#334155;letter-spacing:1px;text-align:center;
+               padding:2px 0;background:#0c1220;border-bottom:1px solid #1e3a5f;
+               flex-shrink:0}
+#spdValue{color:#38bdf8;font-weight:700}
+
 /* ── LAYOUT ── */
-.body{display:flex;height:calc(100vh - 44px - 72px)}
+.body{display:flex;height:calc(100vh - 44px - 18px - 72px)}
 
 /* ── JOYSTICK AREA ── */
 .joy-area{flex:1;position:relative;display:flex;align-items:center;
@@ -131,7 +141,8 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 .arm-btn{flex:1;border:1.5px solid #134e4a;background:#042f2e;color:#5eead4;
          font-size:10px;font-weight:700;border-radius:5px;cursor:pointer;
          font-family:inherit;letter-spacing:.5px;transition:background .1s;
-         display:flex;align-items:center;justify-content:center}
+         display:flex;align-items:center;justify-content:center;
+         touch-action:manipulation}
 .arm-btn:active,.arm-btn.held{background:#0d3d3a;box-shadow:inset 0 0 8px rgba(94,234,212,.2)}
 
 /* LIFT BUTTONS */
@@ -140,7 +151,8 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 .lift-btn{flex:1;border:1.5px solid #1e3a5f;background:#0f172a;color:#7dd3fc;
           font-size:11px;font-weight:700;border-radius:5px;cursor:pointer;
           font-family:inherit;letter-spacing:.5px;transition:background .1s;
-          display:flex;align-items:center;justify-content:center;gap:4px}
+          display:flex;align-items:center;justify-content:center;gap:4px;
+          touch-action:manipulation}
 .lift-btn:active,.lift-btn.held{background:#1e293b;box-shadow:inset 0 0 8px rgba(125,211,252,.2)}
 
 /* ── BOTTOM BAR ── */
@@ -150,13 +162,13 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
          background:transparent;color:#22c55e;font-size:11px;font-weight:700;
          cursor:pointer;font-family:inherit;letter-spacing:.5px;
          display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
-         transition:background .15s}
+         transition:background .15s;touch-action:manipulation}
 .rec-btn .rec-icon{font-size:18px;line-height:1}
 .rec-btn.recording{background:#0a1f0a;color:#4ade80;animation:recpulse 1.5s infinite}
 @keyframes recpulse{0%,100%{background:#0a1f0a}50%{background:#052e16}}
 .estop-btn{flex:1;border:none;background:transparent;
            display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
-           cursor:pointer;transition:background .1s}
+           cursor:pointer;transition:background .1s;touch-action:manipulation}
 .estop-btn .estop-circle{width:48px;height:48px;border-radius:50%;
   background:radial-gradient(circle at 40% 35%,#f87171,#7f1d1d);
   border:2px solid #fca5a5;box-shadow:0 0 16px rgba(239,68,68,.25),inset 0 -3px 6px rgba(0,0,0,.3);
@@ -172,7 +184,7 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
        opacity:0;transition:opacity .25s;z-index:999}
 .flash.show{opacity:1}
 
-/* ── GRID LINES decorative ── */
+/* ── GRID decorative ── */
 .joy-area::before{content:'';position:absolute;inset:0;
   background:radial-gradient(ellipse at center,rgba(56,189,248,.04) 0%,transparent 70%);
   pointer-events:none}
@@ -184,15 +196,18 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 <div class="hdr">
   <span class="hdr-title">AISLEBOT</span>
   <div class="spd-group">
-    <button class="spd-btn active-slow" id="spd0" onclick="setSpeed(0)">SLOW</button>
-    <button class="spd-btn" id="spd1" onclick="setSpeed(1)">MED</button>
-    <button class="spd-btn" id="spd2" onclick="setSpeed(2)">FAST</button>
+    <button class="spd-btn active-slow" id="spd0">SLOW</button>
+    <button class="spd-btn" id="spd1">MED</button>
+    <button class="spd-btn" id="spd2">FAST</button>
   </div>
   <div class="hdr-right">
     <span class="rec-badge" id="recBadge">REC</span>
     <span class="status-dot" id="dot"></span>
   </div>
 </div>
+
+<!-- SPEED INDICATOR -->
+<div class="spd-indicator">SPEED: <span id="spdValue">SLOW — 0.05 m/s</span></div>
 
 <!-- BODY: joystick (left) + right panel -->
 <div class="body">
@@ -238,7 +253,7 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 
 <!-- BOTTOM BAR -->
 <div class="bottom">
-  <button class="rec-btn" id="recBtn" onclick="toggleRecord()">
+  <button class="rec-btn" id="recBtn">
     <span class="rec-icon" id="recIcon">⏺</span>
     <span id="recLabel">RECORD RUN</span>
   </button>
@@ -252,11 +267,16 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 
 <script>
 // ── CONFIG ────────────────────────────────────────────────────────
-const MAX_LINEAR  = 0.48;   // m/s  (matches ESP32 firmware)
-const MAX_ANGULAR = 1.0;    // rad/s
+// FIX: MAX_LINEAR lowered from 0.48 → 0.15 m/s to prevent motor saturation.
+// Old: SLOW=0.12, MED=0.29, FAST=0.48 → MED and FAST both hit the 3 rad/s
+//      wheel speed cap and felt identical.
+// New: SLOW=0.05, MED=0.10, FAST=0.15 → all clearly different, all safe.
+const MAX_LINEAR  = 0.15;   // m/s
+const MAX_ANGULAR = 0.30;   // rad/s
 const DEADZONE    = 0.07;
-const SPEEDS      = [0.25, 0.60, 1.00];
-const SPD_ACTIVE  = ['active-slow','active-normal','active-fast'];
+const SPEEDS      = [0.33, 0.67, 1.00];
+const SPD_LABELS  = ['SLOW — 0.05 m/s', 'MED — 0.10 m/s', 'FAST — 0.15 m/s'];
+const SPD_ACTIVE  = ['active-slow', 'active-normal', 'active-fast'];
 
 // ── STATE ─────────────────────────────────────────────────────────
 let ws, wsOk = false;
@@ -271,8 +291,17 @@ let armInterval = null;
 function connect() {
   const url = 'ws://' + location.host + '/ws';
   ws = new WebSocket(url);
-  ws.onopen  = () => { wsOk = true;  document.getElementById('dot').classList.add('on'); };
-  ws.onclose = () => { wsOk = false; document.getElementById('dot').classList.remove('on'); setTimeout(connect, 1500); };
+  ws.onopen = () => {
+    wsOk = true;
+    document.getElementById('dot').classList.add('on');
+    // FIX: Auto-enable arm on every connection so we never need a manual ENABLE button
+    send({ type: 'arm', cmd: 'ENABLE' });
+  };
+  ws.onclose = () => {
+    wsOk = false;
+    document.getElementById('dot').classList.remove('on');
+    setTimeout(connect, 1500);
+  };
   ws.onerror = () => ws.close();
 }
 connect();
@@ -280,14 +309,27 @@ connect();
 function send(obj) { if (wsOk) ws.send(JSON.stringify(obj)); }
 
 // ── SPEED MODE ────────────────────────────────────────────────────
+// FIX: Speed buttons now use touchstart event listeners instead of onclick.
+// onclick has a 300ms delay on mobile and fails entirely when touch-action:none
+// is set globally. touchstart fires instantly and reliably.
 function setSpeed(idx) {
   speedIdx = idx;
   for (let i = 0; i < 3; i++) {
-    const btn = document.getElementById('spd'+i);
+    const btn = document.getElementById('spd' + i);
     SPD_ACTIVE.forEach(c => btn.classList.remove(c));
     if (i === idx) btn.classList.add(SPD_ACTIVE[i]);
   }
+  document.getElementById('spdValue').textContent = SPD_LABELS[idx];
 }
+
+// Attach touchstart (not onclick) to speed buttons
+[0, 1, 2].forEach(i => {
+  document.getElementById('spd' + i).addEventListener('touchstart', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSpeed(i);
+  }, { passive: false });
+});
 
 // ── JOYSTICK ──────────────────────────────────────────────────────
 const joyArea  = document.getElementById('joyArea');
@@ -303,7 +345,7 @@ function getJoyOffset(touch) {
   let dy = touch.clientY - cy;
   const dist = Math.hypot(dx, dy);
   if (dist > max) { const s = max / dist; dx *= s; dy *= s; }
-  return { dx, dy, nx: dx / max, ny: -dy / max };   // ny: screen-Y inverted
+  return { dx, dy, nx: dx / max, ny: -dy / max };
 }
 
 joyArea.addEventListener('touchstart', e => {
@@ -335,7 +377,7 @@ joyArea.addEventListener('touchend', e => {
     joyX = 0; joyY = 0;
     joyThumb.classList.remove('active');
     joyThumb.style.transform = 'translate(-50%, -50%)';
-    sendDrive();   // zero out immediately on release
+    sendDrive();
   }
 }, { passive: false });
 
@@ -363,7 +405,7 @@ yawTrack.addEventListener('touchend', e => {
     if (t.identifier !== yawTouchId) continue;
     yawActive = false; yawTouchId = null; yawVal = 0;
     yawThumb.style.top = '50%';
-    sendDrive();   // zero on release
+    sendDrive();
   }
 }, { passive: false });
 
@@ -371,23 +413,23 @@ function updateYaw(touch) {
   const r   = yawTrack.getBoundingClientRect();
   const pct = Math.max(0, Math.min(1, (touch.clientY - r.top) / r.height));
   yawThumb.style.top = (pct * 100) + '%';
-  yawVal = -(pct - 0.5) * 2;   // top=CCW(+1), centre=0, bottom=CW(-1)
+  yawVal = -(pct - 0.5) * 2;
 }
 
-// ── DRIVE SEND LOOP (20 Hz while input active) ───────────────────
+// ── DRIVE SEND LOOP (20 Hz) ──────────────────────────────────────
 function applyDead(v) { return Math.abs(v) < DEADZONE ? 0 : v; }
 
 function sendDrive() {
   const m  = SPEEDS[speedIdx];
-  const vx = applyDead(joyY)  * m * MAX_LINEAR;
-  const vy = applyDead(-joyX) * m * MAX_LINEAR;   // right strafe = negative screen-X
-  const wz = applyDead(yawVal)* m * MAX_ANGULAR;
+  const vx = applyDead(joyY)   * m * MAX_LINEAR;
+  const vy = applyDead(-joyX)  * m * MAX_LINEAR;
+  const wz = applyDead(yawVal) * m * MAX_ANGULAR;
   send({ type: 'drive', vx: +vx.toFixed(3), vy: +vy.toFixed(3), wz: +wz.toFixed(3) });
 }
 
 setInterval(() => {
   if ((joyActive || yawActive) && !estopped) sendDrive();
-}, 50);   // 20 Hz
+}, 50);
 
 // ── ARM BUTTONS (hold to move, release stops) ─────────────────────
 function armHold(cmd) {
@@ -412,8 +454,8 @@ function bindHold(id, cmd) {
     if (armInterval) { clearInterval(armInterval); armInterval = null; }
     armRelease();
   };
-  btn.addEventListener('touchend',   stop, { passive: false });
-  btn.addEventListener('touchcancel',stop, { passive: false });
+  btn.addEventListener('touchend',    stop, { passive: false });
+  btn.addEventListener('touchcancel', stop, { passive: false });
 }
 
 bindHold('btnOpen',  'OPEN');
@@ -422,14 +464,14 @@ bindHold('btnUp',    'LIFT');
 bindHold('btnDown',  'LOWER');
 
 // ── RECORD RUN ────────────────────────────────────────────────────
-function toggleRecord() {
+document.getElementById('recBtn').addEventListener('touchstart', e => {
+  e.preventDefault();
   if (estopped) return;
   recording = !recording;
   const btn   = document.getElementById('recBtn');
   const icon  = document.getElementById('recIcon');
   const label = document.getElementById('recLabel');
   const badge = document.getElementById('recBadge');
-
   if (recording) {
     send({ type: 'record_start' });
     btn.classList.add('recording');
@@ -443,7 +485,7 @@ function toggleRecord() {
     label.textContent = 'RECORD RUN';
     badge.classList.remove('show');
   }
-}
+}, { passive: false });
 
 // ── E-STOP ────────────────────────────────────────────────────────
 const estopBtn    = document.getElementById('estopBtn');
@@ -457,12 +499,10 @@ estopBtn.addEventListener('touchstart', e => {
   if (!estopped) {
     estopped = true;
     send({ type: 'estop' });
-    // Force joystick/yaw to zero
     joyX = 0; joyY = 0; yawVal = 0;
     joyActive = false; yawActive = false;
     joyThumb.style.transform = 'translate(-50%,-50%)';
     yawThumb.style.top = '50%';
-    // Stop recording if active
     if (recording) { recording = false; send({ type: 'record_stop' }); }
     estopBtn.classList.add('armed');
     estopCircle.textContent = 'CLEAR';
@@ -475,6 +515,8 @@ estopBtn.addEventListener('touchstart', e => {
     estopBtn.classList.remove('armed');
     estopCircle.textContent = 'E-STOP';
     estopLbl.textContent    = 'TAP TO STOP';
+    // FIX: Re-enable arm after clear (ESP32 ESTOP latches, <E1> un-latches)
+    send({ type: 'arm', cmd: 'ENABLE' });
   }
 }, { passive: false });
 </script>
@@ -491,7 +533,6 @@ class PhoneDashboard(Node):
     def __init__(self):
         super().__init__('phone_dashboard')
 
-        # Parameters
         self.declare_parameter('port',    8080)
         self.declare_parameter('log_dir', '~/aislebot_logs')
 
@@ -502,13 +543,11 @@ class PhoneDashboard(Node):
         os.makedirs(self.log_dir, exist_ok=True)
 
         # ── Publishers ────────────────────────────────────────────
-        self.cmd_vel_pub  = self.create_publisher(Twist,             '/cmd_vel',       10)
-        self.arm_pub      = self.create_publisher(String,            '/arm/command',   10)
-        self.esp32_cmd_pub= self.create_publisher(String,            '/esp32/command', 10)
+        self.cmd_vel_pub   = self.create_publisher(Twist,             '/cmd_vel',       10)
+        self.arm_pub       = self.create_publisher(String,            '/arm/command',   10)
+        self.esp32_cmd_pub = self.create_publisher(String,            '/esp32/command', 10)
 
         # ── Subscribers ───────────────────────────────────────────
-        # Receives [FR_t,FR_a,FR_p, FL_t,FL_a,FL_p, RR_t,RR_a,RR_p, RL_t,RL_a,RL_p]
-        # Published by esp32_bridge when telemetry is enabled.
         self.create_subscription(
             Float64MultiArray, '/motor_telemetry',
             self._telemetry_callback, 10
@@ -521,10 +560,9 @@ class PhoneDashboard(Node):
         self._sample_count = 0
         self._run_path     = ''
 
-        # ── WebSocket client set (touched only from asyncio loop) ─
         self.ws_clients: Set[WebSocket] = set()
 
-        self.get_logger().info(f'Phone Dashboard v2.0 — port {self.port}')
+        self.get_logger().info(f'Phone Dashboard v2.1 — port {self.port}')
         self.get_logger().info(f'Log directory: {self.log_dir}')
 
     # ── Drive ─────────────────────────────────────────────────────
@@ -543,7 +581,7 @@ class PhoneDashboard(Node):
         msg.data = cmd
         self.arm_pub.publish(msg)
 
-    # ── Raw ESP32 serial command (forwarded by esp32_bridge) ──────
+    # ── Raw ESP32 serial command ──────────────────────────────────
 
     def send_esp32_raw(self, cmd: str):
         msg = String()
@@ -556,7 +594,7 @@ class PhoneDashboard(Node):
         if self.recording:
             return self._run_path
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self._run_path = os.path.join(self.log_dir, f'run_{ts}.csv')
+        self._run_path   = os.path.join(self.log_dir, f'run_{ts}.csv')
         self._csv_file   = open(self._run_path, 'w', newline='')
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
@@ -568,7 +606,7 @@ class PhoneDashboard(Node):
         ])
         self._sample_count = 0
         self.recording = True
-        self.send_esp32_raw('<L1>')   # Tell ESP32 to start sending telemetry CSV
+        self.send_esp32_raw('<L1>')
         self.get_logger().info(f'Recording started → {self._run_path}')
         return self._run_path
 
@@ -578,7 +616,7 @@ class PhoneDashboard(Node):
         if not self.recording:
             return
         self.recording = False
-        self.send_esp32_raw('<L0>')   # Tell ESP32 to stop telemetry
+        self.send_esp32_raw('<L0>')
         if self._csv_file:
             self._csv_file.flush()
             self._csv_file.close()
@@ -591,7 +629,6 @@ class PhoneDashboard(Node):
     # ── Telemetry callback ────────────────────────────────────────
 
     def _telemetry_callback(self, msg: Float64MultiArray):
-        """Write one CSV row per incoming telemetry message."""
         if not self.recording or self._csv_writer is None:
             return
         data = list(msg.data)
@@ -600,7 +637,6 @@ class PhoneDashboard(Node):
         row = [f'{time.time():.4f}'] + [f'{v:.4f}' for v in data[:12]]
         self._csv_writer.writerow(row)
         self._sample_count += 1
-        # Flush to disk every 50 samples (~5 s at 10 Hz)
         if self._sample_count % 50 == 0:
             self._csv_file.flush()
 
@@ -609,7 +645,7 @@ class PhoneDashboard(Node):
 #  FASTAPI APP
 # ═══════════════════════════════════════════════════════════════════
 
-app  = FastAPI()
+app   = FastAPI()
 _node: Optional[PhoneDashboard] = None
 
 
@@ -623,6 +659,11 @@ async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     if _node:
         _node.ws_clients.add(websocket)
+        # FIX: Auto-enable arm on every new browser connection from the server side.
+        # This is the server-side counterpart to the client-side send on ws.onopen.
+        # Ensures arm is enabled even if the client-side message is lost during connect.
+        _node.publish_arm('ENABLE')
+        _node.get_logger().info('Dashboard client connected — arm ENABLE sent')
     try:
         while True:
             raw = await websocket.receive_text()
@@ -665,7 +706,6 @@ def _dispatch(msg: dict):
         _node.stop_recording()
 
     elif t == 'estop':
-        # Zero drive immediately, latch E-STOP on ESP32
         _node.publish_drive(0.0, 0.0, 0.0)
         _node.send_esp32_raw('<S>')
         _node.publish_arm('ESTOP')
@@ -673,6 +713,9 @@ def _dispatch(msg: dict):
 
     elif t == 'estop_clear':
         _node.send_esp32_raw('<E1>')
+        # FIX: Re-enable arm after ESTOP clear
+        _node.publish_arm('ENABLE')
+        _node.get_logger().info('ESTOP cleared — arm re-enabled')
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -685,19 +728,17 @@ def main(args=None):
     rclpy.init(args=args)
     _node = PhoneDashboard()
 
-    # ROS2 spin in a background daemon thread
     ros_thread = threading.Thread(target=rclpy.spin, args=(_node,), daemon=True)
     ros_thread.start()
 
-    # uvicorn runs in the main thread (blocks until Ctrl-C)
     uvicorn.run(
         app,
-        host     = '0.0.0.0',
-        port     = _node.port,
-        log_level= 'warning',
+        host      = '0.0.0.0',
+        port      = _node.port,
+        log_level = 'warning',
     )
 
-    _node.stop_recording()   # Ensure CSV is closed cleanly on shutdown
+    _node.stop_recording()
     _node.destroy_node()
     rclpy.shutdown()
 
