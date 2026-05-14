@@ -9,6 +9,7 @@ Subscribes
     /arm/command   std_msgs/String      — discrete events
                        'ENABLE' | 'DISABLE' | 'HOME' | 'ESTOP' | 'CLEAR'
                        'PING'   | 'INFO'    | 'STATUS'
+                       'OPEN'   | 'CLOSE'   | 'LIFT'  | 'LOWER' | 'STOP'
 
 Publishes
     /arm/status    std_msgs/String      — last [STATUS,...] line from Mega
@@ -35,12 +36,12 @@ class ArmBridge(Node):
         super().__init__('arm_bridge')
 
         # ── Parameters ────────────────────────────────────────────
-        self.declare_parameter('serial_port', '/dev/ttyACM0')
+        self.declare_parameter('serial_port', '/dev/mega')          # FIX: was /dev/ttyACM0
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('reconnect_interval', 3.0)
         self.declare_parameter('command_timeout_ms', 300)
         self.declare_parameter('disable_joystick_on_connect', True)
-        self.declare_parameter('auto_enable_on_connect', False)
+        self.declare_parameter('auto_enable_on_connect', True)      # FIX: was False
 
         self.port = self.get_parameter('serial_port').value
         self.baud = self.get_parameter('baud_rate').value
@@ -86,15 +87,18 @@ class ArmBridge(Node):
             time.sleep(2.0)               # Mega autoreset settle
             self.ser.reset_input_buffer()
             self.connected = True
-            self.get_logger().info(f'Connected to Arduino on {self.port}')
+            self.get_logger().info(f'Connected to Arduino Mega on {self.port}')
 
             # Stop fighting with the bench joystick
             if self.disable_joystick:
                 self.send('<J0>')
+                self.get_logger().info('Physical joystick disabled (<J0>)')
 
             self.send('<P>')              # ping
             if self.auto_enable:
-                self.send('<E1>')
+                self.send('<E1>')         # FIX: now actually sends enable
+                self.get_logger().info('Arm enabled on connect (<E1>)')
+
         except serial.SerialException as e:
             self.connected = False
             self.get_logger().warning(f'Serial open failed: {e}')
@@ -105,7 +109,7 @@ class ArmBridge(Node):
 
     # ───────────────────── Subscribers ────────────────────────────
     def cb_twist(self, msg: Twist):
-        # Clamp to [-1, 1]
+        """Handle continuous velocity from /arm/cmd_vel (joystick path)."""
         a = max(-1.0, min(1.0, float(msg.linear.x)))
         l = max(-1.0, min(1.0, float(msg.linear.z)))
         self.last_arm = a
@@ -113,8 +117,23 @@ class ArmBridge(Node):
         self.last_cmd_ts = time.monotonic()
 
     def cb_command(self, msg: String):
+        """
+        Handle discrete commands from /arm/command.
+
+        Discrete (sent to Mega directly):
+            ENABLE DISABLE HOME ESTOP CLEAR PING INFO STATUS
+
+        Motion shortcuts (from phone dashboard hold-buttons):   ← FIX: new
+            OPEN   → arm  = +1.0
+            CLOSE  → arm  = -1.0
+            LIFT   → lift = +1.0
+            LOWER  → lift = -1.0
+            STOP   → arm  =  0.0, lift = 0.0
+        """
         cmd = msg.data.strip().upper()
-        mapping = {
+
+        # ── Discrete serial commands ───────────────────────────────
+        discrete = {
             'ENABLE':  '<E1>',
             'DISABLE': '<E0>',
             'HOME':    '<H>',
@@ -124,20 +143,50 @@ class ArmBridge(Node):
             'INFO':    '<I>',
             'STATUS':  '<?>',
         }
-        if cmd in mapping:
-            self.send(mapping[cmd])
-            self.get_logger().info(f'cmd → {cmd}')
+        if cmd in discrete:
+            self.send(discrete[cmd])
+            self.get_logger().info(f'arm cmd → {cmd}')
+            return
+
+        # ── Motion shortcuts (set velocity, let tx_loop send <A,...>) ──
+        now = time.monotonic()
+        if cmd == 'OPEN':                           # FIX: new
+            self.last_arm  =  1.0
+            self.last_lift =  0.0
+            self.last_cmd_ts = now
+            self.get_logger().info('arm cmd → OPEN  (arm=+1.0)')
+        elif cmd == 'CLOSE':                        # FIX: new
+            self.last_arm  = -1.0
+            self.last_lift =  0.0
+            self.last_cmd_ts = now
+            self.get_logger().info('arm cmd → CLOSE (arm=-1.0)')
+        elif cmd == 'LIFT':                         # FIX: new
+            self.last_arm  =  0.0
+            self.last_lift =  1.0
+            self.last_cmd_ts = now
+            self.get_logger().info('arm cmd → LIFT  (lift=+1.0)')
+        elif cmd == 'LOWER':                        # FIX: new
+            self.last_arm  =  0.0
+            self.last_lift = -1.0
+            self.last_cmd_ts = now
+            self.get_logger().info('arm cmd → LOWER (lift=-1.0)')
+        elif cmd == 'STOP':                         # FIX: new
+            self.last_arm  = 0.0
+            self.last_lift = 0.0
+            # Don't update last_cmd_ts — let watchdog see this as silence
+            # so it keeps sending <A,0,0> via the watchdog path naturally.
+            self.get_logger().info('arm cmd → STOP')
         else:
-            self.get_logger().warning(f'Unknown /arm/command: {cmd}')
+            self.get_logger().warning(f'Unknown /arm/command: "{cmd}"')
 
     # ───────────────────── TX loop ────────────────────────────────
     def tx_loop(self):
         if not self.connected:
             return
 
-        # Watchdog: if no Twist in cmd_timeout window, push zeros once
+        # Watchdog: if no Twist/command in cmd_timeout window, zero out
         if time.monotonic() - self.last_cmd_ts > self.cmd_timeout:
-            self.last_arm = 0.0
+            self.last_arm  = 0.0
             self.last_lift = 0.0
 
         # Send velocity command at 50 Hz
