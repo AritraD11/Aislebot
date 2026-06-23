@@ -1,32 +1,54 @@
 // ============================================================================
-//  AisleBot Arm — Serial-Controlled v7
+//  AisleBot Arm + UV Lighting — Serial-Controlled v8
 //
 //  Receives commands from Raspberry Pi over USB serial at 115200 baud.
 //  Optional analog joystick remains wired for standalone bench testing.
 //
-//  Author: Aritra Das (Roll 25D0074) | IIT Bombay BSBE | May 2026
+//  Author: Aritra Das (Roll 25D0074) | IIT Bombay BSBE | June 2026
 //  Compatible with the unified ROS2 stack (arm_bridge.py)
 //
-//  WIRING (unchanged from v6):
+//  NEW IN v8 — UV tube staged switching:
+//    Three relay-channel pins drive the UV tubes through two 4-channel
+//    active-LOW relay boards whose IN1/IN2/IN3 are ganged (both inverter
+//    sides fire together). On <U1> the tubes light in a staircase:
+//        tube 1  at t = 0
+//        tube 2  at t = 5 s
+//        tube 3  at t = 10 s
+//    <U0> drops all three immediately. ESTOP also kills the tubes.
+//    Sequencing is non-blocking (millis), so arm motion is never paused.
+//
+//  WIRING (arm — unchanged from v6/v7):
 //    TB6600 #1 (Right arm): +5V→5V, CLK-→Pin2, CW-→Pin3, EN-=NC
 //    TB6600 #2 (Left  arm): +5V→5V, CLK-→Pin4, CW-→Pin5, EN-=NC
 //    BH-MSD (Lift):  PUL+→Pin6, DIR+→Pin7, PUL-/DIR-/EN-→GND, ENA+=NC
 //    Joystick (optional): GND→GND, 5V→5V, VRx→A0, VRy→A1, SW→A2
+//
+//  WIRING (UV relays — new in v8, active-LOW, both boards ganged):
+//    Pin 53 → IN1 on board 1 AND board 2   (tube 1, both sides)
+//    Pin 51 → IN2 on board 1 AND board 2   (tube 2, both sides)
+//    Pin 49 → IN3 on board 1 AND board 2   (tube 3, both sides)
+//    Board VCC ← 5V buck (NOT the Mega).  Board GND ← common ground.
+//    Relay contacts: COM = that inverter's Line, NO = choke red, NC empty.
+//    Neutral stays common per inverter and is never switched.
 //
 //  SERIAL PROTOCOL (Pi → Mega):
 //    <P>                 ping → [PONG]
 //    <I>                 info dump
 //    <?>                 status → [STATUS,arm_pos,lift_pos,enabled,estop,homing]
 //    <E1> / <E0>         enable / disable arm motion
-//    <S>                 ESTOP — latched, requires <C> to clear
+//    <S>                 ESTOP — latched, requires <C> to clear (also UV off)
 //    <C>                 clear ESTOP
 //    <H>                 begin HOME sequence (close arms, then lower lift)
 //    <A,arm,lift>        velocity command, two floats in -1.0..+1.0
 //                          arm  > 0  →  open both arms
 //                          lift > 0  →  platform up
 //    <J1> / <J0>         enable / disable analog joystick fallback
+//    <U1>                UV cycle start (staged tubes 1→2→3)
+//    <U0>                UV all off
+//    <U?>                UV status → [UV,active,stage]
 //
 //  WATCHDOG: if no <A,..> command for 500 ms, motion stops automatically.
+//            (UV is NOT watchdogged — tubes stay on until <U0> or ESTOP.)
 //
 //  All position-limit and motor-direction conventions match v6 exactly.
 // ============================================================================
@@ -44,6 +66,11 @@
 #define JOY_Y     A1
 #define JOY_SW    A2
 #define LED_PIN   13
+
+// ── UV tube relays (active-LOW; both 4-ch boards ganged) ─────────
+#define UV_T1     53   // tube 1, both sides
+#define UV_T2     51   // tube 2, both sides
+#define UV_T3     49   // tube 3, both sides
 
 // ── Motion parameters ────────────────────────────────────────────
 const float ARM_SPEED  = 500.0;   // steps/sec (full-scale)
@@ -66,6 +93,9 @@ const int DEADZONE = 80;
 // ── Watchdog ─────────────────────────────────────────────────────
 const unsigned long WATCHDOG_MS = 500;
 
+// ── UV staged lighting ───────────────────────────────────────────
+const unsigned long UV_STAGE_MS = 5000;   // gap between successive tubes
+
 // ── Motor objects ────────────────────────────────────────────────
 AccelStepper mRight(AccelStepper::DRIVER, STEP_M1, DIR_M1);
 AccelStepper mLeft (AccelStepper::DRIVER, STEP_M2, DIR_M2);
@@ -82,6 +112,11 @@ float cmdArmSpd     = 0.0f;       // -1..+1, +ve = OPEN
 float cmdLiftSpd    = 0.0f;       // -1..+1, +ve = UP
 unsigned long lastCmdMs = 0;
 
+// ── UV lighting state ────────────────────────────────────────────
+bool          uvActive  = false;  // is a lighting cycle running?
+byte          uvStage   = 0;      // 0 = off, 1 = t1, 2 = t1+t2, 3 = all
+unsigned long uvStartMs = 0;      // millis() when the cycle began
+
 // ── Joystick button (long-press ESTOP, short-press HOME) ─────────
 bool          btnHeld   = false;
 unsigned long btnStart  = 0;
@@ -93,9 +128,18 @@ bool    inMessage  = false;
 
 // ── Function Prototypes ──────────────────────────────────────────
 void publishStatus(bool force = false);
+void uvAllOff();
+void uvStart();
+void uvUpdate();
 
 // ─────────────────────────────────────────────────────────────────
 void setup() {
+  // UV relays OFF before anything else. Boards are active-LOW, so HIGH
+  // holds the contacts open (tubes dark) the instant the pins are driven.
+  pinMode(UV_T1, OUTPUT); digitalWrite(UV_T1, HIGH);
+  pinMode(UV_T2, OUTPUT); digitalWrite(UV_T2, HIGH);
+  pinMode(UV_T3, OUTPUT); digitalWrite(UV_T3, HIGH);
+
   Serial.begin(115200);
   pinMode(JOY_SW, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
@@ -107,7 +151,7 @@ void setup() {
   mLeft.setCurrentPosition(0);
   mLift.setCurrentPosition(0);
 
-  Serial.println(F("[BOOT] AisleBot Arm v7 ready"));
+  Serial.println(F("[BOOT] AisleBot Arm v8 ready (arm + UV lighting)"));
   Serial.println(F("[BOOT] Serial protocol active. <I> for help."));
 }
 
@@ -116,6 +160,11 @@ void loop() {
   pollSerial();
   pollJoystickButton();
   applyWatchdog();
+
+  // Advance the UV staircase every loop, independent of arm state.
+  // It is a no-op whenever uvActive is false, so estop/homing/disabled
+  // do not affect it beyond the explicit uvAllOff() on estop.
+  uvUpdate();
 
   if (estop) { ledBlink(250); return; }
 
@@ -155,6 +204,7 @@ void handleCommand(const String& cmd) {
   if (cmd == "E0") { enabled = false; cmdArmSpd = cmdLiftSpd = 0;
                      Serial.println(F("[OK] disabled")); return; }
   if (cmd == "S")  { estop = true; homing = false; cmdArmSpd = cmdLiftSpd = 0;
+                     uvAllOff();                       // kill UV on ESTOP
                      Serial.println(F("[OK] ESTOP")); return; }
   if (cmd == "C")  { estop = false; Serial.println(F("[OK] clear")); return; }
   if (cmd == "H")  { if (estop) { Serial.println(F("[ERR] estop")); return; }
@@ -165,6 +215,15 @@ void handleCommand(const String& cmd) {
                      Serial.println(F("[OK] joystick on")); return; }
   if (cmd == "J0") { joystickMode = false;
                      Serial.println(F("[OK] joystick off")); return; }
+
+  // ── UV lighting ──────────────────────────────────────────────
+  if (cmd == "U1") { if (estop) { Serial.println(F("[ERR] estop")); return; }
+                     uvStart();  Serial.println(F("[OK] UV cycle")); return; }
+  if (cmd == "U0") { uvAllOff(); Serial.println(F("[OK] UV off"));  return; }
+  if (cmd == "U?") { Serial.print(F("[UV,"));
+                     Serial.print(uvActive ? 1 : 0); Serial.print(',');
+                     Serial.print(uvStage);
+                     Serial.println(']'); return; }
 
   if (cmd.startsWith("A,")) {
     int comma = cmd.indexOf(',', 2);
@@ -181,15 +240,17 @@ void handleCommand(const String& cmd) {
 }
 
 void printInfo() {
-  Serial.println(F("─────────── AisleBot Arm v7 ───────────"));
+  Serial.println(F("─────────── AisleBot Arm v8 ───────────"));
   Serial.println(F("Commands: <P> <I> <?> <E1>/<E0> <S> <C> <H> <J1>/<J0>"));
   Serial.println(F("          <A,arm,lift>  arm/lift in -1.0..+1.0"));
+  Serial.println(F("          <U1> UV cycle  <U0> UV off  <U?> UV status"));
   Serial.print  (F("ARM_SPEED  = ")); Serial.println(ARM_SPEED);
   Serial.print  (F("LIFT_SPEED = ")); Serial.println(LIFT_SPEED);
   Serial.print  (F("ARM_MAX    = ")); Serial.println(ARM_MAX);
   Serial.print  (F("LIFT_MAX   = ")); Serial.println(LIFT_MAX);
   Serial.print  (F("LIFT_MIN   = ")); Serial.println(LIFT_MIN);
   Serial.print  (F("MIN_LIFT_FOR_ARM = ")); Serial.println(MIN_LIFT_FOR_ARM);
+  Serial.print  (F("UV_STAGE   = ")); Serial.print(UV_STAGE_MS); Serial.println(F(" ms"));
   Serial.print  (F("WATCHDOG   = ")); Serial.print(WATCHDOG_MS); Serial.println(F(" ms"));
 }
 
@@ -214,6 +275,7 @@ void pollJoystickButton() {
       (millis() - btnStart) >= ESTOP_HOLD_MS) {
     estop = true;
     homing = false; cmdArmSpd = cmdLiftSpd = 0;
+    uvAllOff();                                 // kill UV on button ESTOP
     Serial.println(F("[ESTOP] joystick button"));
   }
   if (!pressed && btnHeld) {
@@ -249,6 +311,35 @@ void applyWatchdog() {
     cmdArmSpd  = 0;
     cmdLiftSpd = 0;
   }
+}
+
+// ───────────────────────── UV LIGHTING ──────────────────────────
+// Relay boards are active-LOW: driving a pin LOW closes its relay and
+// lights that tube; HIGH opens it. Because IN1/IN2/IN3 of both boards
+// share each pin, one write controls that tube on BOTH inverter sides.
+
+void uvAllOff() {
+  digitalWrite(UV_T1, HIGH);
+  digitalWrite(UV_T2, HIGH);
+  digitalWrite(UV_T3, HIGH);
+  uvActive = false;
+  uvStage  = 0;
+}
+
+void uvStart() {
+  uvStartMs = millis();
+  uvActive  = true;
+  uvStage   = 1;
+  digitalWrite(UV_T1, LOW);     // tube 1 strikes immediately
+  digitalWrite(UV_T2, HIGH);
+  digitalWrite(UV_T3, HIGH);
+}
+
+void uvUpdate() {
+  if (!uvActive) return;
+  unsigned long dt = millis() - uvStartMs;
+  if (uvStage < 2 && dt >= UV_STAGE_MS)        { digitalWrite(UV_T2, LOW); uvStage = 2; }
+  if (uvStage < 3 && dt >= 2UL * UV_STAGE_MS)  { digitalWrite(UV_T3, LOW); uvStage = 3; }
 }
 
 // ───────────────────── MOTION CORE ──────────────────────────────
