@@ -166,6 +166,14 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
 .rec-btn .rec-icon{font-size:18px;line-height:1}
 .rec-btn.recording{background:#0a1f0a;color:#4ade80;animation:recpulse 1.5s infinite}
 @keyframes recpulse{0%,100%{background:#0a1f0a}50%{background:#052e16}}
+.uv-btn{flex:1;border:none;border-right:1.5px solid #1e3a5f;
+        background:transparent;color:#c084fc;font-size:11px;font-weight:700;
+        cursor:pointer;font-family:inherit;letter-spacing:.5px;
+        display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+        transition:background .15s;touch-action:manipulation}
+.uv-btn .uv-icon{font-size:18px;line-height:1}
+.uv-btn.on{background:#2e1065;color:#e9d5ff;animation:uvpulse 1.5s infinite}
+@keyframes uvpulse{0%,100%{background:#2e1065}50%{background:#3b0764}}
 .estop-btn{flex:1;border:none;background:transparent;
            display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
            cursor:pointer;transition:background .1s;touch-action:manipulation}
@@ -256,6 +264,10 @@ html,body{width:100vw;height:100vh;overflow:hidden;background:#0a0e17;color:#e0e
   <button class="rec-btn" id="recBtn">
     <span class="rec-icon" id="recIcon">⏺</span>
     <span id="recLabel">RECORD RUN</span>
+  </button>
+  <button class="uv-btn" id="uvBtn">
+    <span class="uv-icon" id="uvIcon">☼</span>
+    <span id="uvLabel">UV LIGHTS</span>
   </button>
   <button class="estop-btn" id="estopBtn">
     <div class="estop-circle" id="estopCircle">E-STOP</div>
@@ -487,6 +499,37 @@ document.getElementById('recBtn').addEventListener('touchstart', e => {
   }
 }, { passive: false });
 
+// ── UV LIGHTS (staged on the Mega: T1, +5s T2, +10s T3) ──────────
+let uvOn = false;
+let uvTimers = [];
+
+function uvClearTimers() { uvTimers.forEach(t => clearTimeout(t)); uvTimers = []; }
+function uvLabel(txt)    { document.getElementById('uvLabel').textContent = txt; }
+
+function uvReset() {
+  uvClearTimers();
+  uvOn = false;
+  document.getElementById('uvBtn').classList.remove('on');
+  uvLabel('UV LIGHTS');
+}
+
+document.getElementById('uvBtn').addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (estopped) return;                       // no UV while latched
+  uvOn = !uvOn;
+  if (uvOn) {
+    send({ type: 'uv', cmd: 'on' });
+    document.getElementById('uvBtn').classList.add('on');
+    // Cosmetic mirror of the firmware staircase — real timing lives on the Mega.
+    uvLabel('TUBE 1');
+    uvTimers.push(setTimeout(() => uvLabel('TUBE 1\u00b72'), 5000));
+    uvTimers.push(setTimeout(() => uvLabel('ALL ON'),       10000));
+  } else {
+    send({ type: 'uv', cmd: 'off' });
+    uvReset();
+  }
+}, { passive: false });
+
 // ── E-STOP ────────────────────────────────────────────────────────
 const estopBtn    = document.getElementById('estopBtn');
 const estopCircle = document.getElementById('estopCircle');
@@ -499,6 +542,7 @@ estopBtn.addEventListener('touchstart', e => {
   if (!estopped) {
     estopped = true;
     send({ type: 'estop' });
+    uvReset();                       // firmware drops UV on <S>; mirror it here
     joyX = 0; joyY = 0; yawVal = 0;
     joyActive = false; yawActive = false;
     joyThumb.style.transform = 'translate(-50%,-50%)';
@@ -697,6 +741,13 @@ def _dispatch(msg: dict):
         cmd = msg.get('cmd', '')
         if cmd:
             _node.publish_arm(cmd)
+
+    elif t == 'uv':
+        cmd = msg.get('cmd', '')
+        if cmd == 'on':
+            _node.publish_arm('UV_ON')
+        elif cmd == 'off':
+            _node.publish_arm('UV_OFF')
 
     elif t == 'record_start':
         path = _node.start_recording()
