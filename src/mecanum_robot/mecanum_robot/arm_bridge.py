@@ -10,6 +10,7 @@ Subscribes
                        'ENABLE' | 'DISABLE' | 'HOME' | 'ESTOP' | 'CLEAR'
                        'PING'   | 'INFO'    | 'STATUS'
                        'OPEN'   | 'CLOSE'   | 'LIFT'  | 'LOWER' | 'STOP'
+                       'UV_ON'  | 'UV_OFF'                       (UV tubes)
 
 Publishes
     /arm/status    std_msgs/String      — last [STATUS,...] line from Mega
@@ -142,6 +143,8 @@ class ArmBridge(Node):
             'PING':    '<P>',
             'INFO':    '<I>',
             'STATUS':  '<?>',
+            'UV_ON':   '<U1>',   # staged tube sequence on the Mega: t1, +5s t2, +10s t3
+            'UV_OFF':  '<U0>',   # all tubes off immediately
         }
         if cmd in discrete:
             self.send(discrete[cmd])
@@ -238,7 +241,8 @@ class ArmBridge(Node):
     def shutdown(self):
         self._stop.set()
         try:
-            self.send('<E0>')
+            self.send('<U0>')      # tubes off
+            self.send('<E0>')      # arm disabled
             time.sleep(0.05)
         except Exception:
             pass
